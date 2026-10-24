@@ -707,16 +707,16 @@ pub trait Handler {
     fn set_hyperlink(&mut self, _: Option<Hyperlink>) {}
 
     /// Mark the start of the prompt.
-    fn prompt_start(&mut self) {}
+    fn prompt_start(&mut self, _args: KeyValueArgs<'_>) {}
 
     /// Mark the start of the command the user types, after the prompt.
     fn command_start(&mut self) {}
 
     /// Mark that the command was executed and its output begins.
-    fn command_executed(&mut self) {}
+    fn command_executed(&mut self, __args: KeyValueArgs<'_>) {}
 
     /// Mark that the command finished, with its exit status when known.
-    fn command_finished(&mut self, _: Option<u8>) {}
+    fn command_finished(&mut self, _exit_status: Option<u8>) {}
 
     /// Set mouse cursor icon.
     fn set_mouse_cursor_icon(&mut self, _: CursorIcon) {}
@@ -747,6 +747,31 @@ pub trait Handler {
 
     // Set SCP control.
     fn set_scp(&mut self, _char_path: ScpCharPath, _update_mode: ScpUpdateMode) {}
+}
+
+/// Key/value argument passed to some OSC 133  commands.
+///
+/// Arguments with unknown keys should be ignored.
+pub struct KeyValueArgs<'a> {
+    params: &'a [&'a [u8]],
+}
+
+impl<'a> KeyValueArgs<'a> {
+    fn new(params: &'a [&'a [u8]]) -> Self {
+        Self { params }
+    }
+
+    /// Get the value of a specific key or None.
+    pub fn get(&self, key: &str) -> Option<&str> {
+        let key = key.as_bytes();
+        for param in self.params {
+            if param.starts_with(key) && param.len() > key.len() && param[key.len()] == b'=' {
+                return str::from_utf8(&param[(key.len() + 1)..]).ok();
+            }
+        }
+
+        None
+    }
 }
 
 bitflags! {
@@ -1546,14 +1571,14 @@ where
                     return unhandled(params);
                 }
                 match params[1] {
-                    b"A" => self.handler.prompt_start(),
+                    b"A" => self.handler.prompt_start(KeyValueArgs::new(&params[2..])),
                     b"B" => {
                         self.state.command_started = true;
                         self.handler.command_start();
                     },
                     b"C" => {
                         self.state.command_started = true;
-                        self.handler.command_executed();
+                        self.handler.command_executed(KeyValueArgs::new(&params[2..]));
                     },
                     b"D" => {
                         if self.state.command_started {
@@ -2099,9 +2124,9 @@ mod tests {
 
     #[derive(Debug, PartialEq, Eq)]
     enum PromptEvent {
-        PromptStart,
+        PromptStart(Option<String>),
         CommandStart,
-        CommandExecuted,
+        CommandExecuted(Option<String>),
         CommandFinished(Option<u8>),
     }
 
@@ -2135,16 +2160,18 @@ mod tests {
             self.reset_colors.push(index)
         }
 
-        fn prompt_start(&mut self) {
-            self.prompt_events.push(PromptEvent::PromptStart);
+        fn prompt_start(&mut self, args: KeyValueArgs<'_>) {
+            self.prompt_events
+                .push(PromptEvent::PromptStart(args.get("click_events").map(str::to_string)));
         }
 
         fn command_start(&mut self) {
             self.prompt_events.push(PromptEvent::CommandStart);
         }
 
-        fn command_executed(&mut self) {
-            self.prompt_events.push(PromptEvent::CommandExecuted);
+        fn command_executed(&mut self, args: KeyValueArgs<'_>) {
+            self.prompt_events
+                .push(PromptEvent::CommandExecuted(args.get("cmdline_url").map(str::to_string)));
         }
 
         fn command_finished(&mut self, exit_code: Option<u8>) {
@@ -2257,9 +2284,9 @@ mod tests {
         assert_eq!(
             handler.prompt_events,
             vec![
-                PromptEvent::PromptStart,
+                PromptEvent::PromptStart(None),
                 PromptEvent::CommandStart,
-                PromptEvent::CommandExecuted,
+                PromptEvent::CommandExecuted(None),
                 PromptEvent::CommandFinished(None),
             ]
         );
@@ -2278,9 +2305,9 @@ mod tests {
         assert_eq!(
             handler.prompt_events,
             vec![
-                PromptEvent::CommandExecuted,
+                PromptEvent::CommandExecuted(None),
                 PromptEvent::CommandFinished(Some(0)),
-                PromptEvent::CommandExecuted,
+                PromptEvent::CommandExecuted(None),
                 PromptEvent::CommandFinished(Some(130)),
             ]
         );
@@ -2305,7 +2332,7 @@ mod tests {
         assert_eq!(
             handler.prompt_events,
             vec![
-                PromptEvent::PromptStart,
+                PromptEvent::PromptStart(None),
                 PromptEvent::CommandStart,
                 PromptEvent::CommandFinished(None),
             ]
@@ -2319,7 +2346,7 @@ mod tests {
 
         parser.advance(&mut handler, b"\x1b]133;A\x1b\\");
 
-        assert_eq!(handler.prompt_events, vec![PromptEvent::PromptStart]);
+        assert_eq!(handler.prompt_events, vec![PromptEvent::PromptStart(None)]);
     }
 
     #[test]
@@ -2331,6 +2358,31 @@ mod tests {
         parser.advance(&mut handler, b"\x1b]133;Z\x07");
 
         assert!(handler.prompt_events.is_empty());
+    }
+
+    #[test]
+    fn osc_133_args() {
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+
+        parser.advance(&mut handler, b"\x1b]133;A;redraw=0;click_events=2;special_keys=1\x07");
+        parser.advance(&mut handler, b"\x1b]133;A;click_events=1;click_events=2\x07");
+        parser.advance(&mut handler, b"\x1b]133;C;cmdline_url=ls+-l;cmdline\x07");
+        parser.advance(&mut handler, b"\x1b]133;C;cmdline_url=\x07");
+        parser.advance(&mut handler, b"\x1b]133;C;cmdline_url\x07");
+        parser.advance(&mut handler, b"\x1b]133;C;unknown=value\x07");
+
+        assert_eq!(
+            handler.prompt_events,
+            vec![
+                PromptEvent::PromptStart(Some("2".to_string())),
+                PromptEvent::PromptStart(Some("1".to_string())),
+                PromptEvent::CommandExecuted(Some("ls+-l".to_string())),
+                PromptEvent::CommandExecuted(Some("".to_string())),
+                PromptEvent::CommandExecuted(None),
+                PromptEvent::CommandExecuted(None),
+            ]
+        );
     }
 
     /// No exactly a test; useful for debugging.
