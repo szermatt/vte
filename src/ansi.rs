@@ -729,6 +729,11 @@ pub trait Handler {
 
     // Set SCP control.
     fn set_scp(&mut self, _char_path: ScpCharPath, _update_mode: ScpUpdateMode) {}
+
+    /// Set or clear the current directory.
+    ///
+    /// The argument should be a percent-encoded file: URL.
+    fn set_cwd(&mut self, _url: Option<&str>) {}
 }
 
 bitflags! {
@@ -1389,6 +1394,40 @@ where
                 }
             },
 
+            // CWD; Current directory.
+            b"7" if params.len() >= 2 => {
+                if params[1].is_empty() {
+                    self.handler.set_cwd(None);
+                    return;
+                }
+                let url = match str::from_utf8(params[1]) {
+                    Ok(str) => str,
+                    Err(_) => return,
+                };
+                if params.len() == 2 {
+                    self.handler.set_cwd(Some(url));
+                } else {
+                    // Strictly Speaking, only one parameter is
+                    // expected in 'OSC 7 ; Pt ST', a percent-encoded
+                    // URL. However, incorrectly percent-encoded URLs
+                    // are common, so this code re-builds a URL from
+                    // parameters and accepts UTF8 characters.
+                    //
+                    // URLs with bad UTF encoding are skipped.
+
+                    let mut url = url.to_string();
+                    for extra in params[2..].iter() {
+                        url.push(';');
+                        let extra = match str::from_utf8(extra) {
+                            Ok(str) => str,
+                            Err(_) => return,
+                        };
+                        url.push_str(extra);
+                    }
+                    self.handler.set_cwd(Some(&url));
+                }
+            },
+
             // Hyperlink.
             b"8" if params.len() > 2 => {
                 let link_params = params[1];
@@ -2046,6 +2085,7 @@ mod tests {
         identity_reported: bool,
         color: Option<Rgb>,
         reset_colors: Vec<usize>,
+        cwd: Option<String>,
     }
 
     impl Handler for MockHandler {
@@ -2077,6 +2117,10 @@ mod tests {
         fn reset_color(&mut self, index: usize) {
             self.reset_colors.push(index)
         }
+
+        fn set_cwd(&mut self, cwd: Option<&str>) {
+            self.cwd = cwd.map(str::to_string);
+        }
     }
 
     impl Default for MockHandler {
@@ -2088,6 +2132,7 @@ mod tests {
                 identity_reported: false,
                 color: None,
                 reset_colors: Vec::new(),
+                cwd: None,
             }
         }
     }
@@ -2454,5 +2499,42 @@ mod tests {
         let rgb1 = Rgb { r: 0x12, g: 0x34, b: 0x56 };
         let rgb2 = Rgb { r: 0xFE, g: 0xDC, b: 0xBA };
         assert!((rgb1.contrast(rgb2) - 9.786_558_997_257_74).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn parse_osc7_set_cwd() {
+        let bytes: &[u8] = b"\x1b]7;file://host/path\x1b\\";
+
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+
+        parser.advance(&mut handler, bytes);
+
+        assert_eq!(handler.cwd, Some("file://host/path".to_string()));
+    }
+
+    #[test]
+    fn parse_osc7_set_cwd_with_bad_encoding() {
+        let bytes: &[u8] = "\x1b]7;file://host/f\u{00f3}\u{00f3};bar;bar\x1b\\".as_bytes();
+
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+
+        parser.advance(&mut handler, bytes);
+
+        assert_eq!(handler.cwd, Some("file://host/f\u{00f3}\u{00f3};bar;bar".to_string()));
+    }
+
+    #[test]
+    fn parse_osc7_clear_cwd() {
+        let bytes: &[u8] = b"\x1b]7;\x1b\\";
+
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+        handler.cwd = Some("file://host/path".to_string());
+
+        parser.advance(&mut handler, bytes);
+
+        assert!(handler.cwd.is_none());
     }
 }
